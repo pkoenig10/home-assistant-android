@@ -9,6 +9,7 @@ import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.HttpAuthHandler
 import android.webkit.SslErrorHandler
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -34,6 +35,7 @@ import io.homeassistant.companion.android.themes.ThemesManager
 import io.homeassistant.companion.android.util.TLSWebViewClient
 import io.homeassistant.companion.android.util.compose.HomeAssistantAppTheme
 import io.homeassistant.companion.android.util.isStarted
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Named
 import okhttp3.HttpUrl
@@ -68,15 +70,27 @@ class AuthenticationFragment : Fragment() {
             setContent {
                 HomeAssistantAppTheme {
                     AndroidView({
+                        val urlInfo = buildUrlInfo(viewModel.manualUrl.value)
+
                         WebView(requireContext()).apply {
                             themesManager.setThemeForWebView(requireContext(), settings)
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.userAgentString = settings.userAgentString + " ${HomeAssistantApis.USER_AGENT_STRING}"
                             webViewClient = object : TLSWebViewClient(keyChainRepository) {
+                                val hasHandledHttpAuthRequest = AtomicBoolean()
+
                                 @Deprecated("Deprecated in Java")
                                 override fun shouldOverrideUrlLoading(view: WebView?, url: String): Boolean {
                                     return onRedirect(url)
+                                }
+
+                                override fun onReceivedHttpAuthRequest(view: WebView?, handler: HttpAuthHandler?, host: String?, realm: String?) {
+                                    if (!hasHandledHttpAuthRequest.getAndSet(true) && host.equals(urlInfo.host)) {
+                                        handler?.proceed(urlInfo.username, urlInfo.password)
+                                    } else {
+                                        super.onReceivedHttpAuthRequest(view, handler, host, realm)
+                                    }
                                 }
 
                                 @RequiresApi(Build.VERSION_CODES.M)
@@ -158,8 +172,8 @@ class AuthenticationFragment : Fragment() {
                                     showError(requireContext().getString(commonR.string.error_ssl), error, null)
                                 }
                             }
-                            authUrl = buildAuthUrl(viewModel.manualUrl.value)
-                            loadUrl(authUrl!!)
+                            authUrl = urlInfo.authUrl
+                            loadUrl(authUrl)
                         }
                     })
                 }
@@ -167,29 +181,32 @@ class AuthenticationFragment : Fragment() {
         }
     }
 
-    private fun buildAuthUrl(base: String): String {
+    private fun buildUrlInfo(base: String): ManualUrlInfo {
         return try {
             val url = base.toHttpUrl()
-            val builder = if (url.host.endsWith("ui.nabu.casa", true)) {
-                HttpUrl.Builder()
-                    .scheme(url.scheme)
-                    .host(url.host)
-                    .port(url.port)
-            } else {
-                url.newBuilder()
-            }
-            builder
+            val authUrl = HttpUrl.Builder()
+                .scheme(url.scheme)
+                .username("")
+                .password("")
+                .host(url.host)
+                .port(url.port)
+                .apply {
+                    if (url.host.endsWith("ui.nabu.casa", true)) {
+                        encodedPath("/")
+                    }
+                }
                 .addPathSegments("auth/authorize")
-                .addEncodedQueryParameter("response_type", "code")
-                .addEncodedQueryParameter("client_id", AuthenticationService.CLIENT_ID)
-                .addEncodedQueryParameter("redirect_uri", AUTH_CALLBACK)
+                .addQueryParameter("response_type", "code")
+                .addQueryParameter("client_id", AuthenticationService.CLIENT_ID)
+                .addQueryParameter("redirect_uri", AUTH_CALLBACK)
                 .build()
                 .toString()
+            ManualUrlInfo(authUrl, url.host, url.username, url.password)
         } catch (e: Exception) {
             Log.e(TAG, "Unable to build authentication URL", e)
             Toast.makeText(context, commonR.string.error_connection_failed, Toast.LENGTH_LONG).show()
             parentFragmentManager.popBackStack()
-            ""
+            ManualUrlInfo()
         }
     }
 
@@ -246,4 +263,11 @@ class AuthenticationFragment : Fragment() {
             .show()
         parentFragmentManager.popBackStack()
     }
+
+    private data class ManualUrlInfo(
+        val authUrl: String = "",
+        val host: String = "",
+        val username: String = "",
+        val password: String = ""
+    )
 }
